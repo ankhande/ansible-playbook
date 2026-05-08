@@ -1,1 +1,10 @@
-print("Hello, World!")
+---
+- name: Hello World Playbook
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Print Hello World 5 times
+      debug:
+        msg: "Hello World"
+      loop: "{{ range(1, 6) | list }}"
