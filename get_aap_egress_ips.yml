@@ -1,0 +1,240 @@
+---
+- name: Get Egress IPs for AAP Instance
+  hosts: all
+  gather_facts: false
+  connection: local
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    user: "{{ lookup('ansible.builtin.env', 'USER', default='aoc-saas-bot') }}"
+
+  tasks:
+    - name: Set fact for instance
+      ansible.builtin.set_fact:
+        cloud_account_id: "{{ hostvars[inventory_hostname].cloudaccount }}"
+        instance_name: "{{ inventory_hostname }}"
+        instance_region: "{{ hostvars[inventory_hostname].region }}"
+
+    - name: Strip leading and trailing whitespace
+      ansible.builtin.set_fact:
+        instance_name: "{{ instance_name | trim }}"
+        cloud_account_id: "{{ cloud_account_id | trim }}"
+        instance_region: "{{ instance_region | trim }}"
+
+    - name: Validate the presence of INSTANCE_NAME, ACCOUNT_ID, and INSTANCE_REGION
+      ansible.builtin.assert:
+        that:
+          - instance_name != ""
+          - cloud_account_id != ""
+          - instance_region != ""
+        fail_msg: >
+          The required variables must be set: instance_name (inventory_hostname),
+          cloudaccount, and region must all be defined in the inventory.
+        success_msg: The required variables are available.
+
+    - name: Assume AWS Provisioning Role
+      amazon.aws.sts_assume_role:
+        profile: ""
+        role_arn: "arn:aws:iam::{{ cloud_account_id }}:role/Ansible-SaaS-Provisioning-Role"
+        role_session_name: "assumed-role-{{ instance_name }}-{{ user }}"
+      register: assumed_role
+
+    - name: Get Egress IPs
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ assumed_role.sts_creds.access_key }}"
+        AWS_SECRET_ACCESS_KEY: "{{ assumed_role.sts_creds.secret_key }}"
+        AWS_SESSION_TOKEN: "{{ assumed_role.sts_creds.session_token }}"
+      block:
+
+        # ----------------------------------------------------------------
+        # 1. Discover the AAP EC2 instances
+        # ----------------------------------------------------------------
+        - name: Get EC2 instances for {{ instance_name }}
+          ansible.builtin.shell: >
+            aws ec2 describe-instances
+            --region "{{ instance_region }}"
+            --filters "Name=tag:Name,Values={{ instance_name }}*"
+                      "Name=instance-state-name,Values=running"
+            --query "Reservations[*].Instances[*].{
+                      InstanceId:InstanceId,
+                      PrivateIp:PrivateIpAddress,
+                      PublicIp:PublicIpAddress,
+                      SubnetId:SubnetId,
+                      VpcId:VpcId,
+                      Name:Tags[?Key=='Name']|[0].Value}"
+            --output json
+          register: ec2_instances_raw
+          changed_when: false
+
+        - name: Set fact for EC2 instances
+          ansible.builtin.set_fact:
+            ec2_instances: "{{ ec2_instances_raw.stdout | from_json | flatten }}"
+
+        - name: Fail if no running instances found for {{ instance_name }}
+          ansible.builtin.fail:
+            msg: >
+              No running EC2 instances found with tag Name matching '{{ instance_name }}*'
+              in region {{ instance_region }} / account {{ cloud_account_id }}.
+          when: ec2_instances | length == 0
+
+        - name: Debug discovered instances
+          ansible.builtin.debug:
+            msg: "Found {{ ec2_instances | length }} instance(s): {{ ec2_instances | map(attribute='InstanceId') | list }}"
+
+        # ----------------------------------------------------------------
+        # 2. Check for Elastic IPs associated with the instances
+        # ----------------------------------------------------------------
+        - name: Get Elastic IPs for {{ instance_name }}
+          ansible.builtin.shell: >
+            aws ec2 describe-addresses
+            --region "{{ instance_region }}"
+            --filters "Name=instance-id,Values={{ ec2_instances | map(attribute='InstanceId') | join(',') }}"
+            --query "Addresses[*].{InstanceId:InstanceId,PublicIp:PublicIp,AllocationId:AllocationId}"
+            --output json
+          register: eip_raw
+          changed_when: false
+
+        - name: Set fact for Elastic IPs
+          ansible.builtin.set_fact:
+            elastic_ips: "{{ eip_raw.stdout | from_json }}"
+
+        # ----------------------------------------------------------------
+        # 3. Discover NAT Gateways in the instance VPCs
+        # ----------------------------------------------------------------
+        - name: Set unique VPC IDs from instances
+          ansible.builtin.set_fact:
+            vpc_ids: "{{ ec2_instances | map(attribute='VpcId') | unique | list }}"
+
+        - name: Get NAT Gateways in instance VPCs
+          ansible.builtin.shell: >
+            aws ec2 describe-nat-gateways
+            --region "{{ instance_region }}"
+            --filter "Name=vpc-id,Values={{ vpc_ids | join(',') }}"
+                     "Name=state,Values=available"
+            --query "NatGateways[*].{
+                      NatGatewayId:NatGatewayId,
+                      VpcId:VpcId,
+                      SubnetId:SubnetId,
+                      PublicIp:NatGatewayAddresses[0].PublicIp,
+                      PrivateIp:NatGatewayAddresses[0].PrivateIp}"
+            --output json
+          register: nat_gw_raw
+          changed_when: false
+
+        - name: Set fact for NAT Gateways
+          ansible.builtin.set_fact:
+            nat_gateways: "{{ nat_gw_raw.stdout | from_json }}"
+
+        # ----------------------------------------------------------------
+        # 4. Check route tables to identify NAT-routed subnets
+        # ----------------------------------------------------------------
+        - name: Set unique subnet IDs from instances
+          ansible.builtin.set_fact:
+            subnet_ids: "{{ ec2_instances | map(attribute='SubnetId') | unique | list }}"
+
+        - name: Get route tables for instance subnets
+          ansible.builtin.shell: >
+            aws ec2 describe-route-tables
+            --region "{{ instance_region }}"
+            --filters "Name=association.subnet-id,Values={{ subnet_ids | join(',') }}"
+            --query "RouteTables[*].{
+                      RouteTableId:RouteTableId,
+                      SubnetId:Associations[0].SubnetId,
+                      NatGatewayId:Routes[?NatGatewayId!=null]|[0].NatGatewayId}"
+            --output json
+          register: route_tables_raw
+          changed_when: false
+
+        - name: Set fact for route tables
+          ansible.builtin.set_fact:
+            route_tables: "{{ route_tables_raw.stdout | from_json }}"
+
+        - name: Set NAT-routed subnet IDs
+          ansible.builtin.set_fact:
+            nat_routed_subnets: >-
+              {{
+                route_tables
+                | selectattr('NatGatewayId', 'ne', None)
+                | map(attribute='SubnetId')
+                | list
+              }}
+
+        # ----------------------------------------------------------------
+        # 5. Build and display the egress IP report per instance
+        # ----------------------------------------------------------------
+        - name: Build EIP lookup map (instance_id -> public_ip)
+          ansible.builtin.set_fact:
+            eip_map: >-
+              {{
+                eip_map | default({}) | combine({item.InstanceId: item.PublicIp})
+              }}
+          loop: "{{ elastic_ips }}"
+          loop_control:
+            label: "{{ item.InstanceId }}"
+
+        - name: Display egress IP summary for each instance
+          ansible.builtin.debug:
+            msg: |
+              -------------------------------------------------------
+              Instance     : {{ item.InstanceId }} ({{ item.Name }})
+              VPC          : {{ item.VpcId }}
+              Subnet       : {{ item.SubnetId }}
+              Private IP   : {{ item.PrivateIp }}
+              Direct Public: {{ item.PublicIp | default('none') }}
+              Elastic IP   : {{ (eip_map | default({}))[item.InstanceId] | default('none') }}
+              Via NAT GW   : {{ item.SubnetId in nat_routed_subnets }}
+              *** EFFECTIVE EGRESS IP: {{
+                (eip_map | default({}))[item.InstanceId]
+                if (eip_map | default({}))[item.InstanceId] is defined
+                else item.PublicIp
+                if item.PublicIp is not none
+                else 'Via NAT Gateway — see NAT Gateway summary below'
+              }} ***
+              -------------------------------------------------------
+          loop: "{{ ec2_instances }}"
+          loop_control:
+            label: "{{ item.InstanceId }}"
+
+        - name: Display NAT Gateway egress IPs
+          ansible.builtin.debug:
+            msg: |
+              -------------------------------------------------------
+              NAT Gateway : {{ item.NatGatewayId }}
+              VPC         : {{ item.VpcId }}
+              Subnet      : {{ item.SubnetId }}
+              Public IP   : {{ item.PublicIp }}
+              Private IP  : {{ item.PrivateIp }}
+              -------------------------------------------------------
+          loop: "{{ nat_gateways }}"
+          loop_control:
+            label: "{{ item.NatGatewayId }}"
+          when: nat_gateways | length > 0
+
+        - name: Warn if no NAT Gateways and no public IPs found
+          ansible.builtin.debug:
+            msg: >
+              WARNING: No NAT Gateways found and some instances have no public IP.
+              These instances may be fully private with no internet egress,
+              or may route through a Transit Gateway / VPN not covered by this playbook.
+          when:
+            - nat_gateways | length == 0
+            - ec2_instances | selectattr('PublicIp', 'eq', None) | list | length > 0
+
+        # ----------------------------------------------------------------
+        # 6. Save report to file
+        # ----------------------------------------------------------------
+        - name: Write egress IP report to JSON file
+          ansible.builtin.copy:
+            content: "{{ {'instance_name': instance_name,
+                           'account_id': cloud_account_id,
+                           'region': instance_region,
+                           'instances': ec2_instances,
+                           'elastic_ips': elastic_ips,
+                           'nat_gateways': nat_gateways,
+                           'nat_routed_subnets': nat_routed_subnets}
+                         | to_nice_json }}"
+            dest: "/tmp/{{ instance_name }}-egress-ips.json"
+            mode: '0640'
+
+        - name: Report saved
+          ansible.builtin.debug:
+            msg: "Full report saved to /tmp/{{ instance_name }}-egress-ips.json"
