@@ -72,10 +72,6 @@
               {% endfor %}
               ]
 
-        - name: Convert EC2 instances fact to native JSON list
-          ansible.builtin.set_fact:
-            ec2_instances: "{{ ec2_instances | from_json }}"
-
         - name: Fail if no running instances found for {{ instance_name }}
           ansible.builtin.fail:
             msg: >
@@ -110,10 +106,6 @@
               {% endfor %}
               ]
 
-        - name: Convert Elastic IPs fact to native JSON list
-          ansible.builtin.set_fact:
-            elastic_ips: "{{ elastic_ips | from_json }}"
-
         # ----------------------------------------------------------------
         # 3. Discover NAT Gateways in the instance VPCs
         # ----------------------------------------------------------------
@@ -144,10 +136,6 @@
               {% endfor %}
               ]
 
-        - name: Convert NAT Gateways fact to native JSON list
-          ansible.builtin.set_fact:
-            nat_gateways: "{{ nat_gateways | from_json }}"
-
         # ----------------------------------------------------------------
         # 4. Check route tables to identify NAT-routed subnets
         # ----------------------------------------------------------------
@@ -176,10 +164,6 @@
                 }{% if not loop.last %},{% endif %}
               {% endfor %}
               ]
-
-        - name: Convert route tables fact to native JSON list
-          ansible.builtin.set_fact:
-            route_tables: "{{ route_tables | from_json }}"
 
         - name: Set NAT-routed subnet IDs
           ansible.builtin.set_fact:
