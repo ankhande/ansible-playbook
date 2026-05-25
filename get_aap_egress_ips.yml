@@ -59,18 +59,20 @@
         - name: Set fact for EC2 instances
           ansible.builtin.set_fact:
             ec2_instances: >-
-              {{
-                ec2_instances_raw.instances 
-                | map('combine', {
-                    'InstanceId': 'instance_id',
-                    'PrivateIp': 'private_ip_address',
-                    'PublicIp': 'public_ip_address' | default(none),
-                    'SubnetId': 'subnet_id',
-                    'VpcId': 'vpc_id',
-                    'Name': ('tags' | selectattr('Key', 'equalto', 'Name') | map(attribute='Value') | first | default(''))
-                })
-                | list
-              }}
+              {% set ns = namespace(instances=[]) %}
+              {% for i in ec2_instances_raw.instances %}
+                {% set name_tag = i.tags.Name | default(i.tags.name) | default('') %}
+                {% set normalized = {
+                  'InstanceId': i.instance_id,
+                  'PrivateIp': i.private_ip_address,
+                  'PublicIp': i.public_ip_address | default(none),
+                  'SubnetId': i.subnet_id,
+                  'VpcId': i.vpc_id,
+                  'Name': name_tag
+                } %}
+                {% set ns.instances = ns.instances + [normalized] %}
+              {% endfor %}
+              {{ ns.instances }}
 
         - name: Fail if no running instances found for {{ instance_name }}
           ansible.builtin.fail:
@@ -96,12 +98,16 @@
         - name: Set fact for Elastic IPs
           ansible.builtin.set_fact:
             elastic_ips: >-
-              {{
-                eip_raw.addresses 
-                | map('combine', {'InstanceId': 'instance_id', 'PublicIp': 'public_ip', 'AllocationId': 'allocation_id'})
-                | list
-              }}
-
+              {% set ns = namespace(eips=[]) %}
+              {% for a in eip_raw.addresses %}
+                {% set normalized = {
+                  'InstanceId': a.instance_id | default('', true),
+                  'PublicIp': a.public_ip,
+                  'AllocationId': a.allocation_id
+                } %}
+                {% set ns.eips = ns.eips + [normalized] %}
+              {% endfor %}
+              {{ ns.eips }}
         # ----------------------------------------------------------------
         # 3. Discover NAT Gateways in the instance VPCs
         # ----------------------------------------------------------------
@@ -120,17 +126,18 @@
         - name: Set fact for NAT Gateways
           ansible.builtin.set_fact:
             nat_gateways: >-
-              {{
-                nat_gw_raw.nat_gateways
-                | map('combine', {
-                    'NatGatewayId': 'nat_gateway_id',
-                    'VpcId': 'vpc_id',
-                    'SubnetId': 'subnet_id',
-                    'PublicIp': 'nat_gateway_addresses[0].public_ip',
-                    'PrivateIp': 'nat_gateway_addresses[0].private_ip'
-                })
-                | list
-              }}
+              {% set ns = namespace(gws=[]) %}
+              {% for g in nat_gw_raw.nat_gateways %}
+                {% set normalized = {
+                  'NatGatewayId': g.nat_gateway_id,
+                  'VpcId': g.vpc_id,
+                  'SubnetId': g.subnet_id,
+                  'PublicIp': g.nat_gateway_addresses[0].public_ip | default(''),
+                  'PrivateIp': g.nat_gateway_addresses[0].private_ip | default('')
+                } %}
+                {% set ns.gws = ns.gws + [normalized] %}
+              {% endfor %}
+              {{ ns.gws }}
 
         # ----------------------------------------------------------------
         # 4. Check route tables to identify NAT-routed subnets
@@ -149,16 +156,19 @@
         - name: Set fact for route tables
           ansible.builtin.set_fact:
             route_tables: >-
-              {{
-                route_tables_raw.route_tables
-                | map('combine', {
-                    'RouteTableId': 'route_table_id',
-                    'SubnetId': 'associations[0].subnet_id',
-                    'NatGatewayId': ('routes' | selectattr('nat_gateway_id', 'defined') | map(attribute='nat_gateway_id') | first | default(none))
-                })
-                | list
-              }}
-
+              {% set ns = namespace(rts=[]) %}
+              {% for r in route_tables_raw.route_tables %}
+                {% set nat_route = r.routes | selectattr('nat_gateway_id', 'defined') | map(attribute='nat_gateway_id') | first | default(none) %}
+                {% set assoc_subnet = r.associations | map(attribute='subnet_id') | first | default(none) %}
+                {% set normalized = {
+                  'RouteTableId': r.route_table_id,
+                  'SubnetId': assoc_subnet,
+                  'NatGatewayId': nat_route
+                } %}
+                {% set ns.rts = ns.rts + [normalized] %}
+              {% endfor %}
+              {{ ns.rts }}
+              
         - name: Set NAT-routed subnet IDs
           ansible.builtin.set_fact:
             nat_routed_subnets: >-
