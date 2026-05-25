@@ -72,8 +72,10 @@
                 } %}
                 {% set ns.instances = ns.instances + [normalized] %}
               {% endfor %}
-              {{ ns.instances }}
-
+              {{ ns.instances | to_yaml }}
+          # The from_yaml filter below converts the string back into a real list object
+          vars:
+            ec2_instances: "{{ ec2_instances | from_yaml }}"
         - name: Fail if no running instances found for {{ instance_name }}
           ansible.builtin.fail:
             msg: >
